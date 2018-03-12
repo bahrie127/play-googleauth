@@ -6,7 +6,8 @@ import java.security.SecureRandom
 import java.time.Clock
 import java.util.{Base64, Date}
 
-import com.gu.googleauth.AntiForgeryChecker._
+import com.gu.googleauth.OAuthStateSecurityConfig._
+import com.gu.googleauth.GoogleAuthFilters.LOGIN_ORIGIN_KEY
 import io.jsonwebtoken.{Claims, Jws, Jwts, SignatureAlgorithm}
 import org.joda.time.Duration
 import play.api.http.HttpConfiguration
@@ -39,7 +40,7 @@ case class GoogleAuthConfig private(
   maxAuthAge: Option[Duration],
   enforceValidity: Boolean,
   prompt: Option[String],
-  antiForgeryChecker: AntiForgeryChecker
+  antiForgeryChecker: OAuthStateSecurityConfig
 )
 object GoogleAuthConfig {
   private val defaultMaxAuthAge = None
@@ -54,7 +55,7 @@ object GoogleAuthConfig {
     maxAuthAge: Option[Duration] = defaultMaxAuthAge,
     enforceValidity: Boolean = defaultEnforceValidity,
     prompt: Option[String] = defaultPrompt,
-    antiForgeryChecker: AntiForgeryChecker
+    antiForgeryChecker: OAuthStateSecurityConfig
 
   ): GoogleAuthConfig = GoogleAuthConfig(clientId, clientSecret, redirectUrl, Some(domain), maxAuthAge, enforceValidity, prompt, antiForgeryChecker)
 
@@ -70,7 +71,7 @@ object GoogleAuthConfig {
     maxAuthAge: Option[Duration] = defaultMaxAuthAge,
     enforceValidity: Boolean = defaultEnforceValidity,
     prompt: Option[String] = defaultPrompt,
-    antiForgeryChecker: AntiForgeryChecker
+    antiForgeryChecker: OAuthStateSecurityConfig
   ): GoogleAuthConfig =
     GoogleAuthConfig(clientId, clientSecret, redirectUrl, None, maxAuthAge, enforceValidity, prompt, antiForgeryChecker)
 }
@@ -89,54 +90,25 @@ object GoogleAuthConfig {
   * The design here is partially based on a IETF draft for "Encoding claims in the OAuth 2 state parameter ...":
   * https://tools.ietf.org/html/draft-bradley-oauth-jwt-encoded-state-01
   */
-case class AntiForgeryChecker(
-  signingSecret: String,
-  signatureAlgorithm: SignatureAlgorithm,
-  sessionIdKeyName: String = "play-googleauth-session-id"
+case class OAuthStateSecurityConfig(
+  secret: String,
+  signatureAlgorithm: SignatureAlgorithm
 ) {
 
-  private val base64EncodedSecret: String =
-    Base64.getEncoder.encodeToString(signingSecret.getBytes(UTF_8))
-
-  def ensureUserHasSessionId(t: String => Future[Result])(implicit request: RequestHeader, ec: ExecutionContext):Future[Result] = {
-    val sessionId = request.session.get(sessionIdKeyName).getOrElse(generateSessionId())
-
-    t(sessionId).map(_.addingToSession(sessionIdKeyName -> sessionId))
-  }
-
-  def generateToken(sessionId: String)(implicit clock: Clock = Clock.systemUTC) : String = {
-    Jwts.builder()
-      .setExpiration(Date.from(clock.instant().plusSeconds(60)))
-      .claim(SessionIdJWTClaimPropertyName, sessionId)
-      .signWith(signatureAlgorithm, base64EncodedSecret)
-      .compact()
-  }
 
   def checkChoiceOfSigningAlgorithm(claims: Jws[Claims]): Try[Unit] =
     if (claims.getHeader.getAlgorithm == signatureAlgorithm.getValue) Success(()) else
       Failure(throw new IllegalArgumentException(s"the anti forgery token is not signed with $signatureAlgorithm"))
 
-  def checkTokenContainsCorrectSessionId(claims: Jws[Claims], userSessionId: String): Try[Unit] =
-    if (claims.getBody.get(SessionIdJWTClaimPropertyName) == userSessionId) Success(()) else
-      Failure(throw new IllegalArgumentException("the session ID found in the anti forgery token does not match the Play session ID"))
 
-  def verifyToken(request: RequestHeader): Try[Unit] = for {
-    sessionIdFromPlaySession <- Try(request.session.get(sessionIdKeyName).getOrElse(throw new IllegalArgumentException("No Play session ID found")))
-    oathAntiForgeryState <- Try(request.getQueryString("state").getOrElse(throw new IllegalArgumentException("No anti-forgery state returned in OAuth callback")))
-    jwtClaims <- Try(Jwts.parser().setSigningKey(base64EncodedSecret).parseClaimsJws(oathAntiForgeryState))
-    _ <- checkChoiceOfSigningAlgorithm(jwtClaims)
-    _ <- checkTokenContainsCorrectSessionId(jwtClaims, sessionIdFromPlaySession)
-  } yield ()
 }
 
-object AntiForgeryChecker {
-  private val random = new SecureRandom()
-  def generateSessionId() = new BigInteger(130, random).toString(32)
+object OAuthStateSecurityConfig {
 
   val SessionIdJWTClaimPropertyName = "rfp" // see https://tools.ietf.org/html/draft-bradley-oauth-jwt-encoded-state-01#section-2
 
-  def borrowSettingsFromPlay(httpConfiguration: HttpConfiguration): AntiForgeryChecker = {
-    AntiForgeryChecker(httpConfiguration.secret.secret, SignatureAlgorithm.forName(httpConfiguration.session.jwt.signatureAlgorithm))
+  def borrowSettingsFromPlay(httpConfiguration: HttpConfiguration): OAuthStateSecurityConfig = {
+    OAuthStateSecurityConfig(httpConfiguration.secret.secret, SignatureAlgorithm.forName(httpConfiguration.session.jwt.signatureAlgorithm))
   }
 }
 
@@ -153,31 +125,20 @@ object GoogleAuth {
       discoveryDocumentFuture
     }
 
-  def googleResponse[T](r: WSResponse)(block: JsValue => T): T = {
-    r.status match {
-      case errorCode if errorCode >= 400 =>
-        // try to get error if google sent us an error doc
-        val error = (r.json \ "error").asOpt[Error]
-        error.map { e =>
-          throw new GoogleAuthException(s"Error when calling Google: ${e.message}")
-        }.getOrElse {
-          throw new GoogleAuthException(s"Unknown error when calling Google [status=$errorCode, body=${r.body}]")
-        }
-      case normal => block(r.json)
-    }
-  }
 
   def redirectToGoogle(config: GoogleAuthConfig, sessionId: String)
                       (implicit request: RequestHeader, context: ExecutionContext, ws: WSClient): Future[Result] = {
+    val oAuthStateEncoding: OAuthState.Encoding = ???
+    val oAuthState = OAuthState(sessionId, request.getQueryString(LOGIN_ORIGIN_KEY).get)
     val userIdentity = UserIdentity.fromRequest(request)
     val queryString: Map[String, Seq[String]] = Map(
       "client_id" -> Seq(config.clientId),
       "response_type" -> Seq("code"),
       "scope" -> Seq("openid email profile"),
       "redirect_uri" -> Seq(config.redirectUrl),
-      "state" -> Seq(config.antiForgeryChecker.generateToken(sessionId))) ++
+      "state" -> Seq(oAuthStateEncoding.stringify(oAuthState))) ++
       config.domain.map(domain => "hd" -> Seq(domain)) ++
-      config.maxAuthAge.map(age => "max_auth_age" -> Seq(s"${age.getStandardSeconds}")) ++
+      config.maxAuthAge.map(age => "max_auth_age" -> Seq(age.getStandardSeconds.toString)) ++
       config.prompt.map(prompt => "prompt" -> Seq(prompt)) ++
       userIdentity.map(_.email).map("login_hint" -> Seq(_))
 
@@ -186,42 +147,10 @@ object GoogleAuth {
 
   def validatedUserIdentity(config: GoogleAuthConfig)
         (implicit request: RequestHeader, context: ExecutionContext, ws: WSClient): Future[UserIdentity] = {
-
-    Future.fromTry(config.antiForgeryChecker.verifyToken(request)).flatMap(_ => discoveryDocument()).flatMap { dd =>
-      val code = request.queryString("code")
-      ws.url(dd.token_endpoint).post {
-        Map(
-          "code" -> code,
-          "client_id" -> Seq(config.clientId),
-          "client_secret" -> Seq(config.clientSecret),
-          "redirect_uri" -> Seq(config.redirectUrl),
-          "grant_type" -> Seq("authorization_code")
-        )
-      }.flatMap { response =>
-        googleResponse(response) { json =>
-          val token = Token.fromJson(json)
-          val jwt = token.jwt
-          config.domain foreach { domain =>
-            if (!jwt.claims.email.split("@").lastOption.contains(domain))
-              throw new GoogleAuthException("Configured Google domain does not match")
-          }
-          ws.url(dd.userinfo_endpoint)
-            .withHttpHeaders("Authorization" -> s"Bearer ${token.access_token}")
-            .get().map { response =>
-            googleResponse(response) { json =>
-              val userInfo = UserInfo.fromJson(json)
-              UserIdentity(
-                jwt.claims.sub,
-                jwt.claims.email,
-                userInfo.given_name,
-                userInfo.family_name,
-                jwt.claims.exp,
-                userInfo.picture
-              )
-            }
-          }
-        }
-      }
-    }
+    for {
+      dd <- discoveryDocument()
+      googleOAuthService = new GoogleOAuthService(???, dd)
+      userIdentity <- googleOAuthService.fetchUserIdentityForCode(request.getQueryString("code").get)
+    } yield userIdentity
   }
 }

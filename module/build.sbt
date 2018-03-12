@@ -12,9 +12,11 @@ crossScalaVersions := Seq(scalaVersion.value, "2.11.12")
 resolvers += "Typesafe repository" at "http://repo.typesafe.com/typesafe/releases/"
 
 libraryDependencies ++= Seq(
-  play % "provided",
-  playWS % "provided",
+  play,
+  playWS,
+  akkaHttpCore,
   "org.typelevel" %% "cats-core" % "1.0.1",
+  jose4j,
   commonsCodec,
   googleDataAPI,
   playTest % "test",
